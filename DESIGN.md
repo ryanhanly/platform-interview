@@ -1,33 +1,56 @@
-# Design Decisions
+# Design Decisions and Documentation
 
-## Terraform Refactoring
-- **Modularity**: Used locals and `for_each` loops to define environments and services centrally, eliminating duplication. This makes adding/removing services or environments (e.g., staging) a simple update to the maps, without touching resource blocks.
-- **Abstractions**: Environments are mapped with Vault addresses, tokens, and networks. Services include shared secret data. This promotes reusability and reduces errors.
-- **Simplicity**: Avoided over-engineering by keeping everything in one file; loops handle scaling without external modules.
-- **Staging Environment**: Added as a third environment, replicating dev/prod with unique Vault port (8401) and token for isolation.
+## Design Decisions
+The original `tf/main.tf` was monolithic, with duplicated code for each environment and service, making it hard to maintain as the company grows. To address this, I refactored the code into a reusable Terraform module (`tf/modules/environment/main.tf`) that encapsulates environment-specific resources (Vault audit, auth, secrets, policies, endpoints, Docker networks, and containers).
 
-## Docker Compose Updates
-- **Staging Support**: Added `vault-staging` service and `staging` network to mirror existing environments, ensuring consistent provisioning.
+### Key Changes:
+- **Modular Structure**: The module takes variables for environment, Vault details, services, and frontend image/port. This allows dynamic creation of resources using `for_each` loops, reducing duplication.
+- **Environment Segregation**: Each environment (development, staging, production) is instantiated as a separate module call in `tf/main.tf`, ensuring isolation.
+- **Service Flexibility**: Services are defined in `locals` as a map, making it easy to add/remove services by updating the map and module variables.
+- **Version Control**: Kept existing service versions (e.g., nginx images) and ensured staging mirrors development/production structure.
+- **No External Tools**: Used plain Terraform only, as required.
+- **Staging Environment Creation**: To add staging, I added a new module call in `tf/main.tf` for the staging environment, using the same module source as dev/prod. Files changed: `tf/main.tf` (added module "staging" block with vars for Vault addr/token, services, and frontend image/port), and `docker-compose.yml` (added vault-staging service with network, image, ports, and token). No changes to the module itself, as it dynamically handles environments via variables. This ensured staging runs all services with unique ports/networks/Vault instances.
+- **Terraform Version Constraints**: The original code specified `required_version = ">= 1.0.7"`, which influenced our use of stable, backward-compatible features like `for_each` and modules. If using a newer version (e.g., 1.3+), we could use `optional` attributes in variable types for more flexible module inputs, potentially simplifying service definitions without relying as heavily on `for_each` loops for dynamic resource creation. We would still use modules for environment segregation, as they provide clear abstraction and reusability regardless of version.
 
-# CI/CD Integration
+While rather indicating applying my Terraform skills in Azure and AWS provisioning, including 3rd party hosted appliance - Palo Alto Firewalls and SDWAN appliances, these decisions are based on best practices for IaC scalability.
 
-This setup integrates into CI/CD pipelines as follows:
-- **Provisioning**: Run `vagrant up` in CI to build images, start Docker Compose, and apply Terraform. Use tools like GitHub Actions or Jenkins to automate.
-- **Terraform Commands**: In CI, execute `terraform init`, `terraform plan`, and `terraform apply` in the `tf/` directory. Pass variables (e.g., Vault tokens) via environment secrets.
-- **Testing**: After apply, run integration tests (e.g., curl services to verify Vault secrets retrieval). Destroy resources post-test with `terraform destroy`.
-- **Version Control**: Store Terraform state in a remote backend (e.g., S3) for team collaboration. Use locking to prevent concurrent applies.
-- **Automation Example** (GitHub Actions snippet):
-  ```yaml
-  - name: Provision Infrastructure
-    run: |
-      vagrant up
-      cd tf && terraform apply -auto-approve
+## CI/CD Pipeline Integration
+This Terraform setup integrates with GitHub Actions for automated deployment via Git workflows, with adaptations for cloud environments (e.g., AWS or Azure) by replacing local Docker resources with cloud-native services.
 
-# Production Considerations
-- **Security**: Hardcoded Vault tokens are placeholders; in production, use Vault's auto-unseal with KMS (e.g., AWS KMS) and inject tokens via CI secrets. Enable TLS for Vault communications.
-- **Scalability**: For larger deployments, consider Terraform modules for environments or Kubernetes for service orchestration. Monitor resource usage (e.g., via Prometheus) to scale VMs.
-- **State Management**: Use remote state with locking to avoid corruption. Backup Vault data regularly.
-- **Networking**: In cloud (e.g., AWS), replace local Docker networks with VPCs and security groups. Use load balancers for frontend services.
-- **Monitoring/Logging**: Integrate with ELK stack or CloudWatch for logs. Set up alerts for Vault/service failures.
-- **Compliance**: Ensure secrets rotation and audit logs meet regulatory requirements (e.g., GDPR, PCI).
-- **Cost/Performance**: Use spot instances for staging. Optimize Docker images for size to reduce startup time.
+- **Pipeline Structure**: Use a `.github/workflows/deploy.yml` file with jobs for build, test, plan, and deploy. Trigger on pushes to main branch or pull requests.
+- **Environment Handling**: Use GitHub environments for each env (e.g., dev, staging, prod). Pass env-specific vars like Vault addresses via workflow inputs or secrets.
+- **Automation**:
+  - Local testing: Use Vagrant for dev (as in this setup).
+  - Cloud deployment: Run Terraform commands in GitHub-hosted runners. Use actions like `hashicorp/setup-terraform` for init, validate, plan, and apply.
+  - Approval Gates: Add manual approvals for production via `environment` protection rules.
+- **Variables and Sensitive Information**:
+  - Store non-sensitive vars (e.g., env names) in workflow YAML or repository variables.
+  - Handle sensitive data (Vault tokens, cloud keys) via GitHub Secrets: Reference as `${{ secrets.VAULT_TOKEN }}` in YAML. Use environment secrets for per-env overrides.
+  - Runtime vars: Override Terraform vars via `terraform plan -var-file=env.tfvars` in steps.
+- **State Management**: Use Terraform Cloud as the remote backend for state files, configured in `tf/main.tf` (e.g., `backend "remote" { organization = "your-org" workspaces { name = "env-workspace" } }`). GitHub Actions authenticates via `TF_API_TOKEN` secret, enabling team collaboration and avoiding local state issues.
+- **Testing**: Add steps for `terraform validate` and custom scripts for integration tests (e.g., check Vault connectivity).
+- **Deployment Flow**: Code Push → Build/Test → Terraform Plan (with artifact upload) → Approval → Apply → Post-Deploy Verification.
+- **Cloud Adaptations**:
+  - **Core Reuse**: Vault resources (audit, auth, secrets, policies, endpoints) remain unchanged, as Vault can be deployed on EC2 (AWS), VMs (Azure), or GCE instances (GCP).
+  - **Docker Replacement**: Replace `docker_container` and `docker_network` with:
+    - AWS: `aws_ecs_service`, `aws_ecs_task_definition`, and `aws_vpc` subnets for container orchestration.
+    - Azure: `azurerm_kubernetes_cluster` (AKS) or `azurerm_container_group`, and Azure VNets.
+    - GCP: `google_cloud_run_service` or `google_container_cluster` (GKE), and VPC networks/subnets.
+
+This ensures secure, automated IaC with GitHub Actions handling variables and secrets natively.
+
+## Production Considerations
+Beyond this task, for real production:
+- **State Management**: Use remote state (e.g., Terraform Cloud) to avoid local state issues and enable team collaboration.
+- **Security**: Enable Vault TLS, use IAM roles for access, and rotate tokens regularly. Implement least-privilege policies.
+- **Monitoring/Logging**: Add CloudWatch or ELK for container logs; monitor Vault with metrics.
+- **Scalability**: Use Kubernetes (EKS) instead of Docker for orchestration; implement auto-scaling and load balancers.
+- **Disaster Recovery**: Backup Vault data, use multi-region deployments, and implement rollback strategies.
+- **Compliance**: Ensure GDPR/HIPAA compliance with encryption at rest/transit; audit logs for all changes.
+- **Cost Optimization**: Use spot instances, monitor resource usage, and clean up unused resources.
+- **CI/CD Enhancements**: Add blue-green deployments, canary releases, and automated rollbacks on failures.
+- **Multi-Cloud Support**: To accommodate AWS, Azure, GCP with dev/staging/prod environments using the modular structure:
+  - **High-Level Structure**: Create cloud-specific sub-modules (e.g., `modules/aws/environment`, `modules/azure/environment`, `modules/gcp/environment`) that extend the base `modules/environment/main.tf`. Use conditional logic (e.g., `if var.cloud == "aws"`) or separate module calls in `tf/main.tf` for each cloud.
+  - **Environment Handling**: Use Terraform workspaces (one per env per cloud, e.g., `aws-prod`, `azure-dev`) or variable maps for env-specific configs.
+  - **Key Changes**: In each cloud module, replace Docker resources with provider-specific ones (as above). Add cloud providers (e.g., `aws`, `azurerm`, `google`) and resources like VPCs, IAM roles, and container services. Reuse Vault configs by deploying Vault on cloud instances. Update `locals` in `tf/main.tf` to include cloud vars (e.g., `var.cloud = "aws"`).
+  - **Example**: For AWS prod, call `module "aws-prod" { source = "./modules/aws/environment" cloud = "aws" environment = "production" ... }`. This allows 3 clouds × 3 envs = 9 combinations with minimal duplication.
